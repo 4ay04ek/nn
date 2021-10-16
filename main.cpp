@@ -1,198 +1,143 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <iomanip>
 #include <random>
 #include <algorithm>
 #include <filesystem>
+#include <windows.h>
+#include <armadillo>
 #include <boost/algorithm/string.hpp>
 #include <opencv2/opencv.hpp>
 #include <SFML/Graphics.hpp>
- 
-using namespace cv;
+
+#define ITERS 10
+#define EPOCHS 3
+#define lr 0.1
+
 using namespace boost;
 using namespace std;
 using namespace sf;
+using namespace arma;
 
-double sigmoid(double value) {
-	return 1 / (1 + exp(-value));
+mat cv2arma(string path) {
+	cv::Mat image = cv::imread(path, cv::IMREAD_GRAYSCALE);
+	vector<double> t;
+	for (int i = 0; i < image.rows; i++)
+		for (int j = 0; j < image.cols; j++) {
+			t.push_back((int)image.at<uchar>(i, j) / 255.0);
+		}
+	mat input(t);
+	return input.t();
 }
 
-double sigmoid_d(double value) {
-	return value * (1 - value);
+void sigmoid(double &value) {
+	value = 1 / (1 + exp(-value));
 }
 
-void init(string t, int *target, vector<string> &tmp) {
-	for (int i = 0; i < 10; i++) target[i] = 0;
-	target[t[t.size() - 1] - '0'] = 1;
-	t.erase(t.end() - 3, t.end());
-	erase_all(t, " ");
-	split(tmp, t, is_any_of(","));
+void sigmoid_d(double &value) {
+	sigmoid(value);
+	value = value * (1 - value);
 }
 
-void randWeights(vector<vector<double> > &w) {
-	for (auto &it: w) for (auto &j: it) {
-		j = rand() / 500000.0;
-	}
+mat cost(mat t, mat p) {
+	return 0.5 * pow(p - t, 2);
 }
+
+mat cost_d(mat t, mat p) {
+	return p - t;
+}
+
+double error_rate(mat o, mat t) {
+	mat r = cost_d(t, o);
+	return accu(r) / 10;
+}
+
+void forward(mat i, mat hw, mat& h, mat ow, mat& o, mat& zo, mat& zh) {
+	zh = mat(i.t() * hw).t();
+	h = zh; h.for_each(sigmoid);
+	zh.for_each(sigmoid_d);
+	zo = mat(h.t() * ow).t();
+	o = zo; o.for_each(sigmoid);
+	zo.for_each(sigmoid_d);
+}
+
+void back(mat i, mat t, mat& hw, mat h, mat& ow, mat o, mat zo, mat zh) {
+	mat eO = cost_d(t, o) % zo;
+	mat eH = ow * eO % zh;
+	mat dow = h * eO.t();
+	mat dhw = i * eH.t();
+	hw -= lr * dhw;
+	ow -= lr * dow;
+}
+
 
 int main() {
-	/*vector<pair<Mat, string> > data;
-	for (int i = 0; i < 10; i++)
-		for (auto& it : std::filesystem::directory_iterator("./data/MNIST Dataset JPG format/training/" + to_string(i))) {
-			Mat img = imread(it.path().u8string(), IMREAD_GRAYSCALE);
-			img = img.reshape(1, 1);
-			data.push_back({ img, to_string(i) });
+	HANDLE hd = GetStdHandle(STD_OUTPUT_HANDLE);
+	CONSOLE_CURSOR_INFO info;
+	info.dwSize = 100;
+	info.bVisible = FALSE;
+	SetConsoleCursorInfo(hd, &info);
+	string train_dir = "C:/Users/html_programmer/source/repos/nn/data/MNIST Dataset JPG format/training";
+	string test_dir = "C:/Users/html_programmer/source/repos/nn/data/MNIST Dataset JPG format/testing";
+	arma_rng::set_seed_random();
+	mat hw(784, 28), ow(28, 10);
+	mt19937 engine;
+	uniform_real_distribution<double> distr(-1, 1);
+	hw.imbue([&]() { return distr(engine); });
+	ow.imbue([&]() { return distr(engine); });
+	vector<pair<string, int> > train_data, test_data;
+	for (int target = 0; target < 10; target++) {
+		for (auto it: filesystem::directory_iterator(train_dir + "/" + to_string(target))) {
+			train_data.push_back({ it.path().u8string(), target });
 		}
-	auto rng = default_random_engine{};
-	shuffle(data.begin(), data.end(), rng);
-	ofstream out("data.csv");
-	for (auto it : data) out << format(it.first, Formatter::FMT_CSV) << ", " << it.second << '\n';
-	out.close();*/
-	double e = 0.0001, alpha = 0.00001;
-	ifstream in("data.csv");
-	const int i_n_c = 784, h_n_c = 7, o_n_c = 10;
-	vector<vector<double> > h_weights(i_n_c, vector<double>(h_n_c)), o_weights(h_n_c, vector<double>(o_n_c));
-	randWeights(h_weights);
-	randWeights(o_weights); 
-	string t;
+	}
+	shuffle(train_data.begin(), train_data.end(), engine);
 	int k = 0;
-	/*while (getline(in, t)) {
-		int target[o_n_c]; 
-		vector<string> tmp;
-		init(t, target, tmp);
-		double i_layer[i_n_c];
-		double h_layer[h_n_c], o_layer[o_n_c];
-		double delta_h_layer[h_n_c], delta_o_layer[o_n_c];
-		double o_grad[h_n_c][o_n_c], h_grad[i_n_c][h_n_c];
-		vector<vector<double> > pred_h_delta(i_n_c, vector<double>(h_n_c, 0)), pred_o_delta(h_n_c, vector<double>(o_n_c, 0));
-		for (int i = 0; i < i_n_c; i++) {
-			if (stoi(tmp[i]) > 127) i_layer[i] = 1;
-			else i_layer[i] = 0;
+	for (int epoch = 0; epoch < EPOCHS; epoch++, k = 0)
+		for (auto data : train_data) {
+			vector<double> vt(10, 0); vt[data.second] = 1;
+			mat i = cv2arma(data.first).t();
+			mat h(28, 1), o(10, 1), t(vt), zh(28, 1), zo(10, 1);
+			for (int iters = 0; iters < ITERS; iters++) {
+				forward(i, hw, h, ow, o, zh, zo);
+				back(i, t, hw, h, ow, o, zh, zo);
+			}
+			//cout << fixed;
+			//cout << "Target: " << data.second << "-------->" << error_rate(o, t) << " % <--------\n";
+			//o.t().raw_print();
+			k++;
+			printf("Epoch %d: %d/60000\n", epoch + 1, k);
+			COORD c; c.X = 0; c.Y = 0;
+			SetConsoleCursorPosition(hd, c);
 		}
-		for (int iters = 0; iters < 10000; iters++) {
-			for (int i = 0; i < h_n_c; i++) {
-				double sum = 0;
-				for (int j = 0; j < i_n_c; j++) {
-					sum += h_weights[j][i] * i_layer[j];
-				}
-				h_layer[i] = sigmoid(sum);
-			}
-			for (int i = 0; i < 10; i++) {
-				double sum = 0;
-				for (int j = 0; j < h_n_c; j++) {
-					sum += o_weights[j][i] * h_layer[j];
-				}
-				o_layer[i] = sigmoid(sum);
-			}
-			for (int i = 0; i < o_n_c; i++) {
-				delta_o_layer[i] = (target[i] - o_layer[i]) * sigmoid_d(o_layer[i]);
-			}
-			for (int i = 0; i < h_n_c; i++) {
-				double sum = 0;
-				for (int j = 0; j < o_n_c; j++) {
-					sum += o_weights[i][j] * delta_o_layer[j];
-				}
-				delta_h_layer[i] = sigmoid_d(h_layer[i]) * sum;
-			}
-			for (int i = 0; i < h_n_c; i++) {
-				for (int j = 0; j < o_n_c; j++) {
-					o_grad[i][j] = h_layer[i] * delta_o_layer[j];
-				}
-			}
-			for (int i = 0; i < i_n_c; i++) {
-				for (int j = 0; j < h_n_c; j++) {
-					h_grad[i][j] = i_layer[i] * delta_h_layer[j];
-				}
-			}
-			for (int i = 0; i < i_n_c; i++) {
-				for (int j = 0; j < h_n_c; j++) {
-					double delta = e * h_grad[i][j] + alpha * pred_h_delta[i][j];
-					pred_h_delta[i][j] = delta;
-					h_weights[i][j] += delta;
-				}
-			}
-			for (int i = 0; i < h_n_c; i++) {
-				for (int j = 0; j < o_n_c; j++) {
-					double delta = e * o_grad[i][j] + alpha * pred_o_delta[i][j];
-					pred_o_delta[i][j] = delta;
-					o_weights[i][j] += delta;
-				}
-			}
-		}
-		k++;
-		printf("%d / 60000\n", k);
-	}
-	in.close();
-	ofstream outw("weights.txt");
-	for (int i = 0; i < i_n_c; i++) {
-		for (int j = 0; j < h_n_c; j++) {
-			outw << h_weights[i][j] << ' ';
-		}
-		outw << '\n';
-	}
-	for (int i = 0; i < h_n_c; i++) {
-		for (int j = 0; j < o_n_c; j++) {
-			outw << o_weights[i][j] << ' ';
-		}
-		outw << '\n';
-	}
-	outw.close();*/
-	in.close();
-	ifstream inw("weights.txt");
-	for (int i = 0; i < i_n_c; i++) {
-		for (int j = 0; j < h_n_c; j++) {
-			inw >> h_weights[i][j];
+	for (int target = 0; target < 10; target++) {
+		for (auto it : filesystem::directory_iterator(test_dir + "/" + to_string(target))) {
+			test_data.push_back({ it.path().u8string(), target });
 		}
 	}
-	for (int i = 0; i < h_n_c; i++) {
-		for (int j = 0; j < o_n_c; j++) {
-			inw >> o_weights[i][j];
+	for (auto data : test_data) {
+		vector<double> vt(10, 0); vt[data.second] = 1;
+		mat i = cv2arma(data.first).t();
+		mat h(28, 1), o(10, 1), t(vt), zh(28, 1), zo(10, 1);
+		for (int iters = 0; iters < ITERS; iters++) {
+			forward(i, hw, h, ow, o, zh, zo);
 		}
+		cout << fixed;
+		cout.precision(3);
+		cout << "Target: " << data.second << "-------->" << error_rate(o, t) << " % <--------\n";
+		o.t().raw_print();
+		COORD c; c.X = 0; c.Y = 0;
+		SetConsoleCursorPosition(hd, c);
 	}
-	inw.close();
-	/*ofstream out("test.csv");
-	for (int i = 0; i < 10; i++)
-		for (auto& it : std::filesystem::directory_iterator("./data/MNIST Dataset JPG format/testing/" + to_string(i))) {
-			Mat img = imread(it.path().u8string(), IMREAD_GRAYSCALE);
-			img = img.reshape(1, 1);
-			out << format(img, Formatter::FMT_CSV) << ", " << to_string(i) << '\n';
-		}
-	out.close();*/
-	/*in.open("test.csv");
-	while (getline(in, t)) {
-		vector<string> tmp;
-		char target = t[t.size() - 1];
-		t.erase(t.end() - 3, t.end());
-		erase_all(t, " ");
-		split(tmp, t, is_any_of(","));
-		double i_layer[i_n_c];
-		double h_layer[h_n_c], o_layer[o_n_c];
-		for (int i = 0; i < i_n_c; i++) {
-			if (stoi(tmp[i]) > 127) i_layer[i] = 1;
-			else i_layer[i] = 0;
-		}
-		for (int i = 0; i < h_n_c; i++) {
-			double sum = 0;
-			for (int j = 0; j < i_n_c; j++) {
-				sum += h_weights[j][i] * i_layer[j];
-			}
-			h_layer[i] = sigmoid(sum);
-		}
-		for (int i = 0; i < 10; i++) {
-			double sum = 0;
-			for (int j = 0; j < h_n_c; j++) {
-				sum += o_weights[j][i] * h_layer[j];
-			}
-			o_layer[i] = sigmoid(sum);
-		}
-		for (int i = 0; i < 10; i++) printf("%0.2f ", o_layer[i]);
-		cout << target << '\n';
-	}*/
-	RenderWindow wnd(VideoMode(520, 420), "GUI");
-	vector<int> input(28 * 28);
-	vector<vector<int> > quad_input(28, vector<int>(28, 0));
+	RenderWindow wnd(VideoMode(520, 460), "GUI");
+	vector<double> input(28 * 28);
+	vector<vector<double> > quad_input(28, vector<double>(28, 0));
+	RectangleShape button(Vector2f(520, 40));
+	button.setFillColor(Color(150, 150, 150));
 	Font font;
-	if (!font.loadFromFile("arial.ttf")){}
+	string input_path;
+	if (!font.loadFromFile("arial.ttf")) {}
 	while (wnd.isOpen())
 	{
 		Event event;
@@ -201,53 +146,54 @@ int main() {
 		{
 			if (event.type == Event::Closed)
 				wnd.close();
+			if (event.type == Event::KeyPressed) {
+				if (event.key.code == Keyboard::Space) {
+					std::fill(quad_input.begin(), quad_input.end(), vector<double>(28, 0));
+				}
+			}
 		}
 		if (Mouse::isButtonPressed(Mouse::Left))
 		{
 			Vector2i pos = Mouse::getPosition(wnd);
-			if (pos.x < 420 && pos.y < 420 && pos.x > 0 && pos.y > 0) {
-				quad_input[pos.y / 15][pos.x / 15] = 1;
+			if (pos.x < 420 && pos.y < 460 && pos.x > 0 && pos.y > 40) {
+				quad_input[(pos.y - 40) / 15][pos.x / 15] = 1;
+			}
+			if (button.getGlobalBounds().contains((Vector2f)pos)) {
+				system("cls");
+				getline(cin, input_path);
+				cv::Mat image = cv::imread(input_path, cv::IMREAD_GRAYSCALE);
+				for (int i = 0; i < image.rows; i++)
+					for (int j = 0; j < image.cols; j++) {
+						quad_input[i][j] = (int)image.at<uchar>(i, j) / 255.0;
+					}
 			}
 		}
 		input.clear();
 		for (int i = 0; i < 28; i++) {
 			for (int j = 0; j < 28; j++) {
 				input.push_back(quad_input[i][j]);
-				if (quad_input[i][j]) {
+				if (quad_input[i][j] != 0) {
 					RectangleShape rect(Vector2f(15, 15));
-					rect.setFillColor(Color::Black);
-					rect.setPosition(Vector2f(j * 15, i * 15));
+					rect.setFillColor(Color(255 - 255 * quad_input[i][j], 255 - 255 * quad_input[i][j], 255 - 255 * quad_input[i][j]));
+					rect.setPosition(Vector2f(j * 15, i * 15 + 40));
 					wnd.draw(rect);
 				}
 			}
 		}
-		double h_layer[h_n_c], o_layer[o_n_c];
-		for (int i = 0; i < h_n_c; i++) {
-			double sum = 0;
-			for (int j = 0; j < i_n_c; j++) {
-				sum += h_weights[j][i] * input[j];
-			}
-			h_layer[i] = sigmoid(sum);
-		}
-		for (int i = 0; i < o_n_c; i++) {
-			double sum = 0;
-			for (int j = 0; j < h_n_c; j++) {
-				sum += o_weights[j][i] * h_layer[j];
-			}
-			o_layer[i] = sigmoid(sum);
-		}
+		mat in(input);
+		mat h(28, 1), o(10, 1), zh(28, 1), zo(10, 1);
+		forward(in, hw, h, ow, o, zh, zo);
 		for (int i = 0; i < 10; i++) {
-			printf("%0.2f ", o_layer[i]);
-			RectangleShape rect(Vector2f(5, 50 * o_layer[i]));
+			RectangleShape rect(Vector2f(5, 50 * o.at(i)));
 			rect.setFillColor(Color::Red);
-			rect.setPosition(Vector2f(430, 10 + 42 * i));
+			rect.setPosition(Vector2f(430, 50 + 42 * i));
 			Text num(to_string(i), font, 16);
-			num.setPosition(Vector2f(450, 20 + 42 * i));
+			num.setPosition(Vector2f(450, 60 + 42 * i));
 			num.setFillColor(Color::Black);
 			wnd.draw(rect);
 			wnd.draw(num);
 		}
-		cout << '\n';
+		wnd.draw(button);
 		wnd.display();
 	}
 }
